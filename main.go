@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,9 +18,10 @@ import (
 // config types
 
 type serverConfig struct {
-	Name     string `yaml:"name"`
-	Address  string `yaml:"address"`
-	Password string `yaml:"password"`
+	Name      string `yaml:"name"`
+	Address   string `yaml:"address"`
+	Password  string `yaml:"password"`
+	Container string `yaml:"container,omitempty"` // Docker container name or ID
 }
 
 type appConfig struct {
@@ -57,6 +59,13 @@ func (s serverItem) FilterValue() string { return s.Name }
 type rconResultMsg struct {
 	serverName string
 	cmd        string
+	output     string
+	err        error
+}
+
+type dockerResultMsg struct {
+	serverName string
+	action     string
 	output     string
 	err        error
 }
@@ -166,6 +175,46 @@ func sendRCONCmd(s serverConfig, cmd string) tea.Cmd {
 	}
 }
 
+func dockerAction(s serverConfig, action string) tea.Cmd {
+	return func() tea.Msg {
+		if s.Container == "" {
+			return dockerResultMsg{
+				serverName: s.Name,
+				action:     action,
+				err:        fmt.Errorf("no container configured"),
+			}
+		}
+
+		var args []string
+		switch action {
+		case "start":
+			args = []string{"start", s.Container}
+		case "stop":
+			args = []string{"stop", s.Container}
+		case "restart":
+			args = []string{"restart", s.Container}
+		case "status":
+			args = []string{"inspect", "--format", "{{.State.Status}}", s.Container}
+		default:
+			return dockerResultMsg{
+				serverName: s.Name,
+				action:     action,
+				err:        fmt.Errorf("unknown action: %s", action),
+			}
+		}
+
+		cmd := exec.Command("docker", args...)
+		output, err := cmd.CombinedOutput()
+		
+		return dockerResultMsg{
+			serverName: s.Name,
+			action:     action,
+			output:     string(output),
+			err:        err,
+		}
+	}
+}
+
 // tea.Model
 
 func (m model) Init() tea.Cmd { return textarea.Blink }
@@ -196,6 +245,62 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "ctrl+s":
+			// Docker start
+			s := m.activeServer()
+			if s == nil {
+				m.pushLog("❌ No active server selected.")
+				return m, nil
+			}
+			if s.Container == "" {
+				m.pushLog(fmt.Sprintf("[%s] ⚠️ No container configured", s.Name))
+				return m, nil
+			}
+			m.pushLog(fmt.Sprintf("[%s] 🐳 Starting container: %s", s.Name, s.Container))
+			m.setStatus("Starting container...")
+			return m, dockerAction(*s, "start")
+		case "ctrl+x":
+			// Docker stop
+			s := m.activeServer()
+			if s == nil {
+				m.pushLog("❌ No active server selected.")
+				return m, nil
+			}
+			if s.Container == "" {
+				m.pushLog(fmt.Sprintf("[%s] ⚠️ No container configured", s.Name))
+				return m, nil
+			}
+			m.pushLog(fmt.Sprintf("[%s] 🐳 Stopping container: %s", s.Name, s.Container))
+			m.setStatus("Stopping container...")
+			return m, dockerAction(*s, "stop")
+		case "ctrl+r":
+			// Docker restart
+			s := m.activeServer()
+			if s == nil {
+				m.pushLog("❌ No active server selected.")
+				return m, nil
+			}
+			if s.Container == "" {
+				m.pushLog(fmt.Sprintf("[%s] ⚠️ No container configured", s.Name))
+				return m, nil
+			}
+			m.pushLog(fmt.Sprintf("[%s] 🐳 Restarting container: %s", s.Name, s.Container))
+			m.setStatus("Restarting container...")
+			return m, dockerAction(*s, "restart")
+		case "ctrl+d":
+			// Docker status
+			s := m.activeServer()
+			if s == nil {
+				m.pushLog("❌ No active server selected.")
+				return m, nil
+			}
+			if s.Container == "" {
+				m.pushLog(fmt.Sprintf("[%s] ⚠️ No container configured", s.Name))
+				return m, nil
+			}
+			m.pushLog(fmt.Sprintf("[%s] 🐳 Checking status: %s", s.Name, s.Container))
+			m.setStatus("Checking status...")
+			return m, dockerAction(*s, "status")
 		case "enter":
 			cmdStr := m.input.Value()
 			m.input.Reset()
@@ -223,6 +328,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.pushLog(fmt.Sprintf("[%s] < %s", msg.serverName, out))
 			m.setStatus("OK")
+		}
+		return m, nil
+
+	case dockerResultMsg:
+		if msg.err != nil {
+			m.pushLog(fmt.Sprintf("[%s] 🐳 ERROR: %v", msg.serverName, msg.err))
+			m.setStatus(fmt.Sprintf("Docker %s failed", msg.action))
+		} else {
+			out := msg.output
+			if out == "" {
+				out = "success"
+			}
+			m.pushLog(fmt.Sprintf("[%s] 🐳 %s: %s", msg.serverName, msg.action, out))
+			m.setStatus(fmt.Sprintf("Docker %s OK", msg.action))
 		}
 		return m, nil
 	}
@@ -261,11 +380,15 @@ func (m model) View() string {
 	if status == "" {
 		if s := m.activeServer(); s != nil {
 			status = fmt.Sprintf("Active: %s (%s)", s.Name, s.Address)
+			if s.Container != "" {
+				status += fmt.Sprintf(" | Container: %s", s.Container)
+			}
 		} else {
 			status = "No active server"
 		}
 	}
-	statusBar := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(status)
+	helpText := " [Tab] switch | [Ctrl+S] start | [Ctrl+X] stop | [Ctrl+R] restart | [Ctrl+D] status | [Ctrl+C] quit"
+	statusBar := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(status + "\n" + helpText)
 
 	inputView := lipgloss.NewStyle().Width(rightWidth).Render(m.input.View())
 	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, listView, " ", logView)
